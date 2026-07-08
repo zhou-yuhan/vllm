@@ -55,6 +55,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1 import pd_trace
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -671,9 +672,18 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 num_uncached_common_prefix_tokens = 0
+                connector_name = (
+                    type(self.connector).__name__
+                    if self.connector is not None
+                    else None
+                )
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    pd_trace.record_lookup_start(request, connector_name)
+                    local_lookup_start = pd_trace.stage_start(
+                        request, connector_name
+                    )
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
@@ -713,6 +723,12 @@ class Scheduler(SchedulerInterface):
                         new_computed_blocks, num_new_local_computed_tokens = (
                             self.kv_cache_manager.get_computed_blocks(request)
                         )
+                    pd_trace.stage_end(
+                        request,
+                        local_lookup_start,
+                        "local_kv_lookup_ms",
+                        connector_name,
+                    )
 
                     # In case of hybrid models, obtain hint for Marconi-style APC logic
                     if self.has_mamba_layers:
@@ -724,10 +740,19 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        external_lookup_start = pd_trace.stage_start(
+                            request, connector_name
+                        )
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
                             )
+                        )
+                        pd_trace.stage_end(
+                            request,
+                            external_lookup_start,
+                            "external_kv_lookup_ms",
+                            connector_name,
                         )
 
                         if ext_tokens is None:
@@ -771,6 +796,13 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+                    pd_trace.record_token_sources(
+                        request,
+                        local_cached_tokens=num_new_local_computed_tokens,
+                        external_cached_tokens=num_external_computed_tokens,
+                        load_kv_async=load_kv_async,
+                        connector_name=connector_name,
+                    )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -938,6 +970,7 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    pd_trace.mark_remote_wait_start(request, connector_name)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
@@ -957,6 +990,15 @@ class Scheduler(SchedulerInterface):
                     self._inflight_prefills.add(request)
                     continue
 
+                is_chunked_prefill = (
+                    num_computed_tokens + num_new_tokens < request.num_tokens
+                )
+                pd_trace.mark_compute_start(
+                    request,
+                    num_new_tokens=num_new_tokens,
+                    is_chunked_prefill=is_chunked_prefill,
+                    connector_name=connector_name,
+                )
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1678,6 +1720,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts = routing_data[end - len(new_token_ids) : end]
 
             finish_reason = None
+            finished = False
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
@@ -1710,6 +1753,18 @@ class Scheduler(SchedulerInterface):
                 or kv_transfer_params
                 or stopped
             ):
+                prefill_stats = request.take_prefill_stats()
+                if prefill_stats is not None:
+                    connector_name = (
+                        type(self.connector).__name__
+                        if self.connector is not None
+                        else None
+                    )
+                    pd_trace.emit_request_summary(
+                        request,
+                        finished=finished,
+                        connector_name=connector_name,
+                    )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1721,7 +1776,7 @@ class Scheduler(SchedulerInterface):
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
-                        prefill_stats=request.take_prefill_stats(),
+                        prefill_stats=prefill_stats,
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
@@ -2422,6 +2477,10 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+            connector_name = (
+                type(self.connector).__name__ if self.connector is not None else None
+            )
+            pd_trace.mark_remote_wait_done(request, connector_name)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:

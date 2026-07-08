@@ -100,6 +100,7 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.pd_trace: Any | None = None
 
         if pooling_params is not None:
             # Pooling models.
