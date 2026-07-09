@@ -578,6 +578,12 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
+            connector_name = (
+                type(self.connector).__name__
+                if self.connector is not None
+                else None
+            )
+            pd_trace.record_computed_blocks(request, new_blocks, connector_name)
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -965,6 +971,19 @@ class Scheduler(SchedulerInterface):
                             num_hits=connector_prefix_cache_hits,
                             preempted=request.num_preemptions > 0,
                         )
+
+                if load_kv_async:
+                    pd_trace.record_remote_requested_blocks(
+                        request,
+                        self.kv_cache_manager.get_blocks(request_id),
+                        connector_name,
+                    )
+                else:
+                    pd_trace.record_computed_blocks(
+                        request,
+                        new_blocks,
+                        connector_name,
+                    )
 
                 request = request_queue.pop_request()
                 if load_kv_async:
@@ -1764,6 +1783,11 @@ class Scheduler(SchedulerInterface):
                         request,
                         finished=finished,
                         connector_name=connector_name,
+                        kv_cache_config=self.kv_cache_config,
+                        block_size=self.block_size,
+                        tensor_parallel_size=(
+                            self.parallel_config.tensor_parallel_size
+                        ),
                     )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
