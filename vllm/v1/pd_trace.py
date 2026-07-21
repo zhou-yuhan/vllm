@@ -489,6 +489,26 @@ def _group_byte_info(
     layer_names = getattr(group, "layer_names", None)
     layer_count = len(layer_names) if layer_names is not None else 0
     spec = getattr(group, "kv_cache_spec", None)
+
+    per_layer_specs, byte_source = _get_per_layer_specs(group, spec)
+    if per_layer_specs:
+        ordered_specs = _ordered_per_layer_specs(
+            per_layer_specs,
+            layer_names,
+            index,
+            state,
+        )
+        if ordered_specs is None:
+            return None
+        return _per_layer_group_byte_info(
+            spec=spec,
+            group_index=index,
+            layer_count=layer_count,
+            ordered_specs=ordered_specs,
+            byte_source=byte_source,
+            state=state,
+        )
+
     try:
         page_size_bytes = int(getattr(spec, "page_size_bytes"))
     except (TypeError, ValueError, AttributeError, NotImplementedError) as exc:
@@ -525,7 +545,7 @@ def _group_byte_info(
             return None
         group_block_bytes_per_rank = page_size_bytes * layer_count
         page_size_bytes_per_layer = page_size_bytes
-        byte_source = "spec_page_size_bytes_per_layer"
+        byte_source = "legacy_group_page_size"
     if group_block_bytes_per_rank <= 0:
         _append_note_once(
             state,
@@ -542,6 +562,138 @@ def _group_byte_info(
         "page_size_bytes_per_group": page_size_bytes,
         "group_block_bytes_per_rank": group_block_bytes_per_rank,
         "byte_source": byte_source,
+    }
+
+
+def _get_per_layer_specs(
+    group: Any,
+    spec: Any,
+) -> tuple[dict[str, Any] | None, str]:
+    byte_accounting_specs = getattr(group, "byte_accounting_kv_cache_specs", None)
+    if isinstance(byte_accounting_specs, dict) and byte_accounting_specs:
+        return byte_accounting_specs, "scheduler_byte_accounting_kv_cache_specs"
+    spec_kv_cache_specs = getattr(spec, "kv_cache_specs", None)
+    if isinstance(spec_kv_cache_specs, dict) and spec_kv_cache_specs:
+        return spec_kv_cache_specs, "per_layer_kv_cache_specs"
+    return None, ""
+
+
+def _ordered_per_layer_specs(
+    per_layer_specs: dict[str, Any],
+    layer_names: Any,
+    group_index: int,
+    state: PDTraceState,
+) -> list[tuple[str, Any]] | None:
+    if layer_names:
+        ordered: list[tuple[str, Any]] = []
+        missing: list[str] = []
+        for layer_name in layer_names:
+            key = str(layer_name)
+            layer_spec = per_layer_specs.get(key)
+            if layer_spec is None:
+                missing.append(key)
+            else:
+                ordered.append((key, layer_spec))
+        if missing:
+            _append_note_once(
+                state,
+                "kv_bytes_estimate_unavailable:"
+                f"group_{group_index}_missing_byte_accounting_specs:"
+                f"{','.join(missing[:5])}",
+            )
+            return None
+        return ordered
+    return [
+        (str(layer_name), layer_spec)
+        for layer_name, layer_spec in per_layer_specs.items()
+    ]
+
+
+def _per_layer_group_byte_info(
+    *,
+    spec: Any,
+    group_index: int,
+    layer_count: int,
+    ordered_specs: list[tuple[str, Any]],
+    byte_source: str,
+    state: PDTraceState,
+) -> dict[str, Any] | None:
+    page_size_summary: list[dict[str, Any]] = []
+    summary_index: dict[tuple[str, int, int], dict[str, Any]] = {}
+    page_sizes: set[int] = set()
+    block_sizes: set[int] = set()
+    group_block_bytes_per_rank = 0
+
+    for layer_name, layer_spec in ordered_specs:
+        try:
+            page_size_bytes = int(getattr(layer_spec, "page_size_bytes"))
+        except (
+            TypeError,
+            ValueError,
+            AttributeError,
+            NotImplementedError,
+        ) as exc:
+            _append_note_once(
+                state,
+                "kv_bytes_estimate_unavailable:"
+                f"group_{group_index}_layer_{layer_name}_missing_page_size_bytes:"
+                f"{type(exc).__name__}",
+            )
+            return None
+        if page_size_bytes <= 0:
+            _append_note_once(
+                state,
+                "kv_bytes_estimate_unavailable:"
+                f"group_{group_index}_layer_{layer_name}_invalid_page_size",
+            )
+            return None
+
+        block_size = _parse_positive_int(
+            getattr(layer_spec, "block_size", None),
+            default=0,
+        )
+        kind = type(layer_spec).__name__
+        key = (kind, page_size_bytes, block_size)
+        row = summary_index.get(key)
+        if row is None:
+            row = {
+                "kind": kind,
+                "page_size_bytes": page_size_bytes,
+                "block_size": block_size,
+                "layer_count": 0,
+            }
+            summary_index[key] = row
+            page_size_summary.append(row)
+        row["layer_count"] += 1
+        page_sizes.add(page_size_bytes)
+        if block_size > 0:
+            block_sizes.add(block_size)
+        group_block_bytes_per_rank += page_size_bytes
+
+    if group_block_bytes_per_rank <= 0:
+        _append_note_once(
+            state,
+            "kv_bytes_estimate_unavailable:"
+            f"group_{group_index}_zero_group_block_bytes",
+        )
+        return None
+    if layer_count <= 0:
+        layer_count = len(ordered_specs)
+
+    page_size_bytes_per_layer = (
+        next(iter(page_sizes)) if len(page_sizes) == 1 else None
+    )
+    effective_block_size = next(iter(block_sizes)) if len(block_sizes) == 1 else 0
+    return {
+        "group_index": group_index,
+        "kind": type(spec).__name__ if spec is not None else "unknown",
+        "layer_count": layer_count,
+        "effective_block_size": effective_block_size,
+        "page_size_bytes_per_layer": page_size_bytes_per_layer,
+        "page_size_bytes_per_group": group_block_bytes_per_rank,
+        "group_block_bytes_per_rank": group_block_bytes_per_rank,
+        "byte_source": byte_source,
+        "page_size_summary": page_size_summary,
     }
 
 
